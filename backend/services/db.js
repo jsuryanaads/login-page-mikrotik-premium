@@ -9,13 +9,17 @@ export function dbEnabled() {
 
 function getPool() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not configured');
-  if (!pool) pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false } });
+  if (!pool) pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false }
+  });
   return pool;
 }
 
 export async function initDb() {
   if (!dbEnabled()) return false;
-  await getPool().query(`
+  const client = getPool();
+  await client.query(`
     CREATE TABLE IF NOT EXISTS hotspot_orders (
       order_id TEXT PRIMARY KEY,
       package_id TEXT NOT NULL,
@@ -27,6 +31,9 @@ export async function initDb() {
       payment_status TEXT NOT NULL DEFAULT 'pending',
       provisioning_status TEXT NOT NULL DEFAULT 'pending',
       generated_password TEXT,
+      activation_token_hash TEXT,
+      activation_expires_at TIMESTAMPTZ,
+      credentials_delivered_at TIMESTAMPTZ,
       midtrans_transaction_status TEXT,
       payment_type TEXT,
       midtrans_transaction_id TEXT,
@@ -39,6 +46,9 @@ export async function initDb() {
       provisioned_at TIMESTAMPTZ
     )
   `);
+  await client.query('ALTER TABLE hotspot_orders ADD COLUMN IF NOT EXISTS activation_token_hash TEXT');
+  await client.query('ALTER TABLE hotspot_orders ADD COLUMN IF NOT EXISTS activation_expires_at TIMESTAMPTZ');
+  await client.query('ALTER TABLE hotspot_orders ADD COLUMN IF NOT EXISTS credentials_delivered_at TIMESTAMPTZ');
   return true;
 }
 
@@ -47,14 +57,17 @@ export async function saveOrder(order) {
     INSERT INTO hotspot_orders (
       order_id, package_id, package_json, username, customer_name, customer_phone,
       amount, payment_status, provisioning_status, generated_password,
+      activation_token_hash, activation_expires_at, credentials_delivered_at,
       midtrans_transaction_status, payment_type, midtrans_transaction_id, mikrotik_id,
       provisioning_error, midtrans_token, payment_url, created_at, paid_at, provisioned_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
     ON CONFLICT (order_id) DO UPDATE SET
       package_id=EXCLUDED.package_id, package_json=EXCLUDED.package_json, username=EXCLUDED.username,
       customer_name=EXCLUDED.customer_name, customer_phone=EXCLUDED.customer_phone, amount=EXCLUDED.amount,
       payment_status=EXCLUDED.payment_status, provisioning_status=EXCLUDED.provisioning_status,
-      generated_password=EXCLUDED.generated_password, midtrans_transaction_status=EXCLUDED.midtrans_transaction_status,
+      generated_password=EXCLUDED.generated_password, activation_token_hash=EXCLUDED.activation_token_hash,
+      activation_expires_at=EXCLUDED.activation_expires_at, credentials_delivered_at=EXCLUDED.credentials_delivered_at,
+      midtrans_transaction_status=EXCLUDED.midtrans_transaction_status,
       payment_type=EXCLUDED.payment_type, midtrans_transaction_id=EXCLUDED.midtrans_transaction_id,
       mikrotik_id=EXCLUDED.mikrotik_id, provisioning_error=EXCLUDED.provisioning_error,
       midtrans_token=EXCLUDED.midtrans_token, payment_url=EXCLUDED.payment_url,
@@ -63,6 +76,7 @@ export async function saveOrder(order) {
     order.order_id, order.package_id, JSON.stringify(order.package), order.username || null,
     order.customer_name || null, order.customer_phone || null, order.amount,
     order.payment_status, order.provisioning_status, order.generated_password || null,
+    order.activation_token_hash || null, order.activation_expires_at || null, order.credentials_delivered_at || null,
     order.midtrans_transaction_status || null, order.payment_type || null,
     order.midtrans_transaction_id || null, order.mikrotik_id || null,
     order.provisioning_error || null, order.midtrans_token || null, order.payment_url || null,
@@ -85,6 +99,9 @@ export async function findOrder(orderId) {
     payment_status: row.payment_status,
     provisioning_status: row.provisioning_status,
     generated_password: row.generated_password || null,
+    activation_token_hash: row.activation_token_hash || null,
+    activation_expires_at: row.activation_expires_at,
+    credentials_delivered_at: row.credentials_delivered_at,
     midtrans_transaction_status: row.midtrans_transaction_status || null,
     payment_type: row.payment_type || null,
     midtrans_transaction_id: row.midtrans_transaction_id || null,
