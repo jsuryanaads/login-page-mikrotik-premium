@@ -1,4 +1,4 @@
-export async function createHotspotUser({ baseUrl, username, password, profile = 'default', limitUptime, routerUsername, routerPassword, verifyTls = true }) {
+export async function createHotspotUser({ baseUrl, username, password, profile = 'default', limitUptime, routerUsername, routerPassword }) {
   if (!baseUrl || !routerUsername || !routerPassword) {
     throw new Error('MikroTik REST credentials are not configured');
   }
@@ -6,7 +6,17 @@ export async function createHotspotUser({ baseUrl, username, password, profile =
     throw new Error('HotSpot user data is incomplete');
   }
 
-  const endpoint = `${baseUrl.replace(/\/$/, '')}/rest/ip/hotspot/user/add`;
+  let url;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new Error('MIKROTIK_BASE_URL is invalid');
+  }
+  if (url.protocol !== 'https:') {
+    throw new Error('MikroTik REST API wajib menggunakan HTTPS');
+  }
+
+  const endpoint = `${url.toString().replace(/\/$/, '')}/rest/ip/hotspot/user/add`;
   const headers = {
     Authorization: `Basic ${Buffer.from(`${routerUsername}:${routerPassword}`).toString('base64')}`,
     'Content-Type': 'application/json',
