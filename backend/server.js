@@ -36,6 +36,10 @@ function tokenMatches(token, order) {
   return supplied.length === stored.length && crypto.timingSafeEqual(supplied, stored);
 }
 
+function htmlEscape(value) {
+  return String(value ?? '').replace(/[&<>\"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', "'": '&#39;' }[char]));
+}
+
 app.disable('x-powered-by');
 app.use(express.json({ limit: '32kb' }));
 app.use((_req, res, next) => {
@@ -97,10 +101,41 @@ app.get('/api/orders/:orderId', async (req, res) => {
 });
 
 app.get('/payment/result', async (req, res) => {
-  const order = await getOrder(String(req.query.order_id || ''));
+  const orderId = String(req.query.order_id || '');
+  const activationToken = String(req.query.activation_token || '');
+  const order = await getOrder(orderId);
   if (!order) return res.status(404).send('Order tidak ditemukan.');
-  const state = order.provisioning_status === 'provisioned' ? 'AKUN HOTSPOT SIAP' : order.payment_status === 'paid' ? 'PEMBAYARAN BERHASIL' : 'MENUNGGU PEMBAYARAN';
-  res.type('html').send(`<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Status Pembayaran</title><style>body{font-family:system-ui;margin:0;background:#0b1020;color:#fff;display:grid;place-items:center;min-height:100vh}.card{width:min(92%,420px);padding:28px;border:1px solid #ffffff20;border-radius:20px;background:#ffffff0d}h1{font-size:22px}code{word-break:break-all}</style></head><body><main class="card"><h1>${state}</h1><p>Order: <code>${order.order_id}</code></p><p>Status pembayaran: <strong>${order.payment_status}</strong></p><p>Status provisioning: <strong>${order.provisioning_status}</strong></p>${order.provisioning_status === 'provisioned' ? `<p>Username: <strong>${order.username}</strong></p><p>Kredensial lengkap diberikan melalui respons aktivasi yang sah.</p>` : '<p>Jika pembayaran sudah selesai, tunggu webhook payment gateway diproses.</p>'}</main></body></html>`);
+
+  let credentials = null;
+  let activationError = '';
+  if (activationToken && !order.credentials_delivered_at && order.payment_status === 'paid') {
+    if (!tokenMatches(activationToken, order)) {
+      activationError = 'Token aktivasi tidak valid atau sudah kedaluwarsa.';
+    } else {
+      try {
+        const provisioned = await provisionPaidOrder(order);
+        if (provisioned.provisioning_status === 'provisioned') {
+          provisioned.credentials_delivered_at = new Date().toISOString();
+          await putOrder(provisioned);
+          credentials = { username: provisioned.username, password: provisioned.generated_password, package: provisioned.package.name };
+        }
+      } catch (error) {
+        activationError = 'Akun HotSpot belum dapat dibuat. Silakan coba lagi setelah MikroTik tersedia.';
+      }
+    }
+  }
+
+  const state = credentials || order.credentials_delivered_at || order.provisioning_status === 'provisioned'
+    ? 'AKUN HOTSPOT SIAP'
+    : order.payment_status === 'paid' ? 'PEMBAYARAN BERHASIL' : 'MENUNGGU PEMBAYARAN';
+  const statusHtml = credentials
+    ? `<p>Username: <strong>${htmlEscape(credentials.username)}</strong></p><p>Password: <strong>${htmlEscape(credentials.password)}</strong></p><p>Paket: <strong>${htmlEscape(credentials.package)}</strong></p><p>Simpan kredensial ini. Token aktivasi hanya dapat digunakan sekali.</p>`
+    : activationError
+      ? `<p>${htmlEscape(activationError)}</p>`
+      : order.provisioning_status === 'provisioned'
+        ? `<p>Username: <strong>${htmlEscape(order.username)}</strong></p><p>Kredensial lengkap hanya dapat diberikan melalui token aktivasi yang sah.</p>`
+        : `<p>Status pembayaran: <strong>${htmlEscape(order.payment_status)}</strong></p><p>Status provisioning: <strong>${htmlEscape(order.provisioning_status)}</strong></p><p>Jika pembayaran sudah selesai, tunggu webhook payment gateway diproses.</p>`;
+  res.type('html').send(`<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Status Pembayaran</title><style>body{font-family:system-ui;margin:0;background:#0b1020;color:#fff;display:grid;place-items:center;min-height:100vh}.card{width:min(92%,420px);padding:28px;border:1px solid #ffffff20;border-radius:20px;background:#ffffff0d}h1{font-size:22px}code{word-break:break-all}</style></head><body><main class="card"><h1>${state}</h1><p>Order: <code>${htmlEscape(order.order_id)}</code></p>${statusHtml}</main></body></html>`);
 });
 
 app.post('/api/payments/create', async (req, res) => {
@@ -108,6 +143,8 @@ app.post('/api/payments/create', async (req, res) => {
   if (!order) return res.status(404).json({ ok: false, error: 'Order tidak ditemukan.' });
   if (order.payment_status !== 'pending') return res.status(409).json({ ok: false, error: 'Order sudah diproses.' });
   if (!process.env.MIDTRANS_SERVER_KEY) return res.status(503).json({ ok: false, error: 'Payment gateway belum dikonfigurasi.' });
+  const activationToken = String(req.body?.activation_token || '');
+  if (!tokenMatches(activationToken, order)) return res.status(403).json({ ok: false, error: 'Token aktivasi order tidak valid.' });
   try {
     const result = await createSnapTransaction({
       serverKey: process.env.MIDTRANS_SERVER_KEY,
@@ -117,7 +154,7 @@ app.post('/api/payments/create', async (req, res) => {
       packageName: order.package.name,
       customerName: order.customer_name,
       customerPhone: order.customer_phone,
-      finishUrl: `${process.env.PUBLIC_BASE_URL || 'http://localhost:3000'}/payment/result?order_id=${encodeURIComponent(order.order_id)}`
+      finishUrl: `${process.env.PUBLIC_BASE_URL || 'http://localhost:3000'}/payment/result?order_id=${encodeURIComponent(order.order_id)}&activation_token=${encodeURIComponent(activationToken)}`
     });
     order.midtrans_token = result.token;
     order.payment_url = result.redirect_url;
