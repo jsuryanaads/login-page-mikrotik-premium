@@ -1,0 +1,5 @@
+UPLOAD THIS FOLDER TO THE MIKROTIK HOTSPOT HTML DIRECTORY.
+
+Required files: login.html, status.html, logout.html, error.html, redirect.html, alogin.html, api.json, css/style.css, js/app.js, js/md5.js.
+
+The CHAP reference is login-chap.html. Before production, validate login.html against the exact RouterOS version and ensure the CHAP handler is active. Do not put payment secrets in the hotspot files.
