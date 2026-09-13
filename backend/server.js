@@ -2,14 +2,15 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import express from 'express';
 import { createSnapTransaction, isSuccessfulNotification, verifyNotificationSignature } from './services/midtrans.js';
+import { createHotspotUser } from './services/mikrotik.js';
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
 const orders = new Map();
 const packages = [
-  { id: '1h', name: '1 Jam', duration_minutes: 60, price: 5000 },
-  { id: '6h', name: '6 Jam', duration_minutes: 360, price: 10000 },
-  { id: '24h', name: '24 Jam', duration_minutes: 1440, price: 15000 }
+  { id: '1h', name: '1 Jam', duration_minutes: 60, price: 5000, limit_uptime: '1h' },
+  { id: '6h', name: '6 Jam', duration_minutes: 360, price: 10000, limit_uptime: '6h' },
+  { id: '24h', name: '24 Jam', duration_minutes: 1440, price: 15000, limit_uptime: '24h' }
 ];
 
 app.disable('x-powered-by');
@@ -54,6 +55,7 @@ app.get('/api/orders/:orderId', (req, res) => {
 app.post('/api/payments/create', async (req, res) => {
   const order = orders.get(req.body?.order_id);
   if (!order) return res.status(404).json({ ok: false, error: 'Order tidak ditemukan.' });
+  if (order.payment_status !== 'pending') return res.status(409).json({ ok: false, error: 'Order sudah diproses.' });
   if (!process.env.MIDTRANS_SERVER_KEY) return res.status(503).json({ ok: false, error: 'Payment gateway belum dikonfigurasi.' });
   try {
     const result = await createSnapTransaction({
@@ -75,7 +77,39 @@ app.post('/api/payments/create', async (req, res) => {
   }
 });
 
-app.post('/api/payments/webhook/midtrans', (req, res) => {
+async function provisionPaidOrder(order) {
+  if (order.payment_status !== 'paid' || order.provisioning_status === 'provisioned') return order;
+  order.provisioning_status = 'processing';
+  orders.set(order.order_id, order);
+  const username = order.username || `wifi-${crypto.randomBytes(3).toString('hex')}`;
+  const password = crypto.randomBytes(6).toString('base64url').slice(0, 10);
+  try {
+    const result = await createHotspotUser({
+      baseUrl: process.env.MIKROTIK_BASE_URL,
+      routerUsername: process.env.MIKROTIK_USERNAME,
+      routerPassword: process.env.MIKROTIK_PASSWORD,
+      verifyTls: process.env.MIKROTIK_VERIFY_TLS !== 'false',
+      username,
+      password,
+      profile: process.env.MIKROTIK_HOTSPOT_PROFILE || 'default',
+      limitUptime: order.package.limit_uptime
+    });
+    order.username = username;
+    order.generated_password = password;
+    order.mikrotik_id = result?.['.id'] || result?.id || null;
+    order.provisioning_status = 'provisioned';
+    order.provisioned_at = new Date().toISOString();
+    orders.set(order.order_id, order);
+    return order;
+  } catch (error) {
+    order.provisioning_status = 'failed';
+    order.provisioning_error = error.message;
+    orders.set(order.order_id, order);
+    throw error;
+  }
+}
+
+app.post('/api/payments/webhook/midtrans', async (req, res) => {
   const body = req.body || {};
   if (!process.env.MIDTRANS_SERVER_KEY) return res.status(503).json({ ok: false, error: 'Payment gateway belum dikonfigurasi.' });
   if (!verifyNotificationSignature(body, process.env.MIDTRANS_SERVER_KEY)) return res.status(403).json({ ok: false, error: 'Signature tidak valid.' });
@@ -93,11 +127,28 @@ app.post('/api/payments/webhook/midtrans', (req, res) => {
     order.payment_status = body.transaction_status;
   }
   orders.set(order.order_id, order);
-  res.json({ ok: true });
+
+  if (order.payment_status === 'paid') {
+    try {
+      await provisionPaidOrder(order);
+    } catch (error) {
+      return res.status(202).json({ ok: true, payment_status: 'paid', provisioning_status: 'failed', error: error.message });
+    }
+  }
+  res.json({ ok: true, payment_status: order.payment_status, provisioning_status: order.provisioning_status });
 });
 
-app.post('/api/hotspot/activate', (_req, res) => {
-  res.status(501).json({ ok: false, error: 'MikroTik provisioning adapter belum diaktifkan.' });
+app.post('/api/hotspot/activate', async (req, res) => {
+  const order = orders.get(req.body?.order_id);
+  if (!order) return res.status(404).json({ ok: false, error: 'Order tidak ditemukan.' });
+  if (order.payment_status !== 'paid') return res.status(409).json({ ok: false, error: 'Pembayaran belum terverifikasi.' });
+  if (order.provisioning_status === 'provisioned') return res.json({ ok: true, data: { username: order.username, password: order.generated_password } });
+  try {
+    const provisioned = await provisionPaidOrder(order);
+    res.json({ ok: true, data: { username: provisioned.username, password: provisioned.generated_password } });
+  } catch (error) {
+    res.status(502).json({ ok: false, error: 'Gagal membuat akun HotSpot di MikroTik.', detail: error.message });
+  }
 });
 
 app.use((_req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
