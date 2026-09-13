@@ -1,10 +1,10 @@
 {
   "name": "mikrotik-hotspot-payment-backend",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Backend for MikroTik HotSpot package payments.",
   "type": "module",
   "engines": { "node": ">=24" },
-  "scripts": { "start": "node server.js", "dev": "node --watch server.js", "check": "node --check server.js" },
-  "dependencies": { "express": "^5.1.0", "dotenv": "^17.2.2" }
+  "scripts": { "start": "node server.js", "dev": "node --watch server.js", "check": "node --check server.js && node --check services/midtrans.js && node --check services/mikrotik.js && node --check services/db.js" },
+  "dependencies": { "dotenv": "^17.2.2", "express": "^5.1.0", "pg": "^8.16.3" }
 }
