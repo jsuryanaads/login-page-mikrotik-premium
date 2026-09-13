@@ -27,7 +27,7 @@ async function startPayment(packageId) {
     const paymentResponse = await fetch(`${apiBase}/api/payments/create`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ order_id: order.data.order_id })
+      body: JSON.stringify({ order_id: order.data.order_id, activation_token: order.data.activation_token })
     });
     const payment = await paymentResponse.json();
     if (!paymentResponse.ok || !payment.ok) throw new Error(payment.error || 'Pembayaran gagal dibuat.');
