@@ -26,6 +26,20 @@ app.use((_req, res, next) => {
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'mikrotik-hotspot-payment-backend' }));
 app.get('/api/packages', (_req, res) => res.json({ data: packages }));
 
+function publicOrder(order) {
+  return {
+    order_id: order.order_id,
+    package: order.package,
+    amount: order.amount,
+    payment_status: order.payment_status,
+    provisioning_status: order.provisioning_status,
+    username: order.provisioning_status === 'provisioned' ? order.username : null,
+    created_at: order.created_at,
+    paid_at: order.paid_at || null,
+    provisioned_at: order.provisioned_at || null
+  };
+}
+
 app.post('/api/orders', (req, res) => {
   const selected = packages.find((item) => item.id === req.body?.package_id);
   if (!selected) return res.status(400).json({ ok: false, error: 'Paket tidak ditemukan.' });
@@ -43,13 +57,20 @@ app.post('/api/orders', (req, res) => {
     created_at: new Date().toISOString()
   };
   orders.set(orderId, order);
-  res.status(201).json({ ok: true, data: { order_id: orderId, package: selected, amount: selected.price, status: order.payment_status } });
+  res.status(201).json({ ok: true, data: publicOrder(order) });
 });
 
 app.get('/api/orders/:orderId', (req, res) => {
   const order = orders.get(req.params.orderId);
   if (!order) return res.status(404).json({ ok: false, error: 'Order tidak ditemukan.' });
-  res.json({ ok: true, data: order });
+  res.json({ ok: true, data: publicOrder(order) });
+});
+
+app.get('/payment/result', (req, res) => {
+  const order = orders.get(String(req.query.order_id || ''));
+  if (!order) return res.status(404).send('Order tidak ditemukan.');
+  const state = order.provisioning_status === 'provisioned' ? 'AKUN HOTSPOT SIAP' : order.payment_status === 'paid' ? 'PEMBAYARAN BERHASIL' : 'MENUNGGU PEMBAYARAN';
+  res.type('html').send(`<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Status Pembayaran</title><style>body{font-family:system-ui;margin:0;background:#0b1020;color:#fff;display:grid;place-items:center;min-height:100vh}.card{width:min(92%,420px);padding:28px;border:1px solid #ffffff20;border-radius:20px;background:#ffffff0d}h1{font-size:22px}code{word-break:break-all}a{color:#9fd3ff}</style></head><body><main class="card"><h1>${state}</h1><p>Order: <code>${order.order_id}</code></p><p>Status pembayaran: <strong>${order.payment_status}</strong></p><p>Status provisioning: <strong>${order.provisioning_status}</strong></p>${order.provisioning_status === 'provisioned' ? `<p>Username: <strong>${order.username}</strong></p><p>Password tersedia hanya pada respons aktivasi yang sah.</p>` : '<p>Jika pembayaran sudah selesai, tunggu webhook payment gateway diproses.</p>'}</main></body></html>`);
 });
 
 app.post('/api/payments/create', async (req, res) => {
@@ -79,6 +100,7 @@ app.post('/api/payments/create', async (req, res) => {
 
 async function provisionPaidOrder(order) {
   if (order.payment_status !== 'paid' || order.provisioning_status === 'provisioned') return order;
+  if (order.provisioning_status === 'processing') return order;
   order.provisioning_status = 'processing';
   orders.set(order.order_id, order);
   const username = order.username || `wifi-${crypto.randomBytes(3).toString('hex')}`;
@@ -128,7 +150,7 @@ app.post('/api/payments/webhook/midtrans', async (req, res) => {
   }
   orders.set(order.order_id, order);
 
-  if (order.payment_status === 'paid') {
+  if (order.payment_status === 'paid' && order.provisioning_status !== 'provisioned') {
     try {
       await provisionPaidOrder(order);
     } catch (error) {
