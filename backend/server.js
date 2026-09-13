@@ -24,6 +24,18 @@ async function putOrder(order) {
   memoryOrders.set(order.order_id, order);
 }
 
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function tokenMatches(token, order) {
+  if (!token || !order.activation_token_hash || !order.activation_expires_at) return false;
+  if (new Date(order.activation_expires_at).getTime() <= Date.now()) return false;
+  const supplied = Buffer.from(hashToken(token), 'hex');
+  const stored = Buffer.from(order.activation_token_hash, 'hex');
+  return supplied.length === stored.length && crypto.timingSafeEqual(supplied, stored);
+}
+
 app.disable('x-powered-by');
 app.use(express.json({ limit: '32kb' }));
 app.use((_req, res, next) => {
@@ -56,7 +68,10 @@ app.post('/api/orders', async (req, res) => {
   const selected = packages.find((item) => item.id === req.body?.package_id);
   if (!selected) return res.status(400).json({ ok: false, error: 'Paket tidak ditemukan.' });
   if (process.env.NODE_ENV === 'production' && !dbEnabled()) return res.status(503).json({ ok: false, error: 'Database produksi belum dikonfigurasi.' });
+
   const orderId = `HS-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const activationToken = crypto.randomBytes(32).toString('base64url');
+  const activationExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
   const order = {
     order_id: orderId,
     package_id: selected.id,
@@ -67,10 +82,12 @@ app.post('/api/orders', async (req, res) => {
     amount: selected.price,
     payment_status: 'pending',
     provisioning_status: 'pending',
+    activation_token_hash: hashToken(activationToken),
+    activation_expires_at: activationExpiresAt,
     created_at: new Date().toISOString()
   };
   await putOrder(order);
-  res.status(201).json({ ok: true, data: publicOrder(order) });
+  res.status(201).json({ ok: true, data: { ...publicOrder(order), activation_token: activationToken, activation_expires_at: activationExpiresAt } });
 });
 
 app.get('/api/orders/:orderId', async (req, res) => {
@@ -123,7 +140,6 @@ async function provisionPaidOrder(order) {
       baseUrl: process.env.MIKROTIK_BASE_URL,
       routerUsername: process.env.MIKROTIK_USERNAME,
       routerPassword: process.env.MIKROTIK_PASSWORD,
-      verifyTls: process.env.MIKROTIK_VERIFY_TLS !== 'false',
       username,
       password,
       profile: process.env.MIKROTIK_HOTSPOT_PROFILE || 'default',
@@ -176,11 +192,16 @@ app.post('/api/payments/webhook/midtrans', async (req, res) => {
 app.post('/api/hotspot/activate', async (req, res) => {
   const order = await getOrder(req.body?.order_id);
   if (!order) return res.status(404).json({ ok: false, error: 'Order tidak ditemukan.' });
+  if (order.credentials_delivered_at) return res.status(410).json({ ok: false, error: 'Kredensial sudah pernah diberikan. Token aktivasi sudah tidak dapat digunakan lagi.' });
+  if (!tokenMatches(String(req.body?.activation_token || ''), order)) return res.status(403).json({ ok: false, error: 'Token aktivasi tidak valid atau sudah kedaluwarsa.' });
   if (order.payment_status !== 'paid') return res.status(409).json({ ok: false, error: 'Pembayaran belum terverifikasi.' });
-  if (order.provisioning_status === 'provisioned') return res.json({ ok: true, data: { username: order.username, password: order.generated_password } });
+
   try {
     const provisioned = await provisionPaidOrder(order);
-    res.json({ ok: true, data: { username: provisioned.username, password: provisioned.generated_password } });
+    if (provisioned.provisioning_status !== 'provisioned') return res.status(409).json({ ok: false, error: 'Akun HotSpot belum siap.' });
+    provisioned.credentials_delivered_at = new Date().toISOString();
+    await putOrder(provisioned);
+    res.json({ ok: true, data: { username: provisioned.username, password: provisioned.generated_password, package: provisioned.package.name } });
   } catch (error) {
     res.status(502).json({ ok: false, error: 'Gagal membuat akun HotSpot di MikroTik.', detail: error.message });
   }
